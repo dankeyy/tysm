@@ -1,0 +1,7 @@
+(executable
+ (public_name w)
+ (name w)
+ (libraries w)
+ (flags (:standard -w -37-34-32))
+ (preprocess
+  (pps ppx_deriving.show)))
