@@ -1,16 +1,17 @@
+(* ----------------------------------------- data types ----------------------------------------- *)
 type lit =
   | Int of int64
   | Bool of bool
 [@@deriving show]
 
 
-and expr =
+and expression =
   | Variable of string
-  | Abstraction of string * expr
-  | Application of expr * expr
-  | Let of string * expr * expr
+  | Abstraction of string * expression
+  | Application of expression * expression
+  | Let of string * expression * expression
   | Lit of lit
-  | Tuple of expr list
+  | Tuple of expression list
 [@@deriving show]
 
 
@@ -29,6 +30,12 @@ type type_variable = string
 
 (* hack to use it in a map type *)
 module TypeVariableMap = Map.Make(struct
+  type t = type_variable
+  let compare = Stdlib.compare
+end)
+
+
+module TypeVariableSet = Set.Make(struct
   type t = type_variable
   let compare = Stdlib.compare
 end)
@@ -62,6 +69,8 @@ type type_inference_state = {
 }
 
 
+
+(* ----------------------------------------- helpers ----------------------------------------- *)
 let new_type_inference_state () : type_inference_state = {
   counter = 0
 }
@@ -72,6 +81,10 @@ let fresh_type_variable(inference: type_inference_state) : type_variable =
   inference.counter <- inference.counter + 1;
   var
 
+
+
+(* ----------------------------------------- substitutions ----------------------------------------- *)
+(* materializing the solutions found by unification *)
 
 (* substitute type within type *)
 let rec substitute (t : wtype) (subs : substitutions) : wtype =
@@ -97,6 +110,152 @@ let substitute_in_scheme (subs : substitutions) (sch : scheme) : scheme =
 
 let substitute_in_environment (env : environment) (subs : substitutions) : environment =
   TermVariableMap.map (substitute_in_scheme subs) env
+
+
+let show_substitutions (subs : substitutions) : string =
+  if TypeVariableMap.is_empty subs then
+    "{}"
+  else
+    let bindings = TypeVariableMap.bindings subs in
+    "{" ^
+    (String.concat ", " (List.map (fun (v, t) ->
+       Printf.sprintf "%s/%s" (show_wtype t) v
+     ) bindings)) ^
+    "}"
+
+
+
+(* ----------------------------------------- unification ----------------------------------------- *)
+(* unification is the root of the constraints solving. its product are the substitutions*)
+
+type inference_tree = {
+  rule     : string;
+  input    : string;
+  output   : string;
+  children : inference_tree list;
+}
+[@@deriving show]
+let make_tree (rule : string) (input : string) (output : string) (children : inference_tree list)
+  : inference_tree =
+  { rule; input; output; children }
+
+
+let rec occurs_check (v : type_variable) (t : wtype) : bool =
+  match t with
+  | Variable name -> name = v
+  | Arrow (t1, t2) -> occurs_check v t1 || occurs_check v t2
+  | Tuple ts -> List.exists (occurs_check v) ts
+  | Int | Bool -> false
+
+
+exception TypeError of string
+
+
+let rec unify (t1 : wtype) (t2 : wtype) : substitutions * inference_tree =
+  let input = Printf.sprintf "%s ~ %s" (show_wtype t1) (show_wtype t2) in
+
+  match (t1, t2) with
+  | (Int, Int) | (Bool, Bool) ->
+      let tree = make_tree "concrete" input "{}" [] in
+      (* these are both concrete types so nothing to unify *)
+      (TypeVariableMap.empty, tree)
+
+  | (Variable v, t) when t = Variable v ->
+      (* it's the same variable, nothing to unify *)
+      let tree = make_tree "same-variable" input "{}" [] in
+      (TypeVariableMap.empty, tree)
+
+  | (Variable v, t) | (t, Variable v) ->
+      if occurs_check v t then
+        (* infinite type is just unrecoverable *)
+        raise (TypeError (Printf.sprintf "occurs_check failed: %s occurs in %s" v (show_wtype t)))
+      else
+        (* not the same variable, so add a substitution from the var name to the type *)
+        let subs = TypeVariableMap.singleton v t in
+        let output = show_substitutions subs in
+        let tree = make_tree "unify-variables" input output [] in
+        (subs, tree)
+
+  | (Arrow (a1, a2), Arrow (b1, b2)) ->
+      (* this is s bit more nuanced than the rest but the idea is to basically *)
+      (* first unify the params -> get substitution -> fix return types based on it -> unify return types *)
+      (* -> compose the param substitution and return substitution into the final substitution *)
+      let (s1, tree1) = unify a1 b1 in
+      let a2' = substitute a2 s1 in
+      let b2' = substitute b2 s1 in
+      let (s2, tree2) = unify a2' b2' in
+      let final_s = compose_substitutions s2 s1 in
+      let output = show_substitutions final_s in
+      let tree = make_tree "unify-arrows" input output [tree1; tree2] in
+      (final_s, tree)
+
+  | (Tuple ts1, Tuple ts2) ->
+      (* unify in a zip-like manner *)
+      if List.length ts1 <> List.length ts2 then
+        raise (TypeError (Printf.sprintf "length mismatch: %d vs %d"
+                          (List.length ts1) (List.length ts2)));
+
+      let rec loop (current_subs : substitutions) (trees : inference_tree list)
+                   (remaining1 : wtype list) (remaining2 : wtype list) =
+        match remaining1, remaining2 with
+        | [], [] -> (current_subs, List.rev trees)
+        | t1 :: r1, t2 :: r2 ->
+            let t1s = substitute t1 current_subs in
+            let t2s = substitute t2 current_subs in
+            let (s_new, tree) = unify t1s t2s in
+            let new_subs = compose_substitutions s_new current_subs in
+            loop new_subs (tree :: trees) r1 r2
+        | _ -> assert false
+
+      in
+      let (final_subs, child_trees) = loop TypeVariableMap.empty [] ts1 ts2 in
+      let output = show_substitutions final_subs in
+      let tree = make_tree "unify-tuples" input output child_trees in
+      (final_subs, tree)
+
+  | _ ->
+      raise (TypeError (Printf.sprintf "unify failure: %s and %s"
+                        (show_wtype t1) (show_wtype t2)))
+
+
+
+(* ------------------------------- generalization x instantiation ------------------------------- *)
+let rec find_free_type_variables_in_type (t : wtype) =
+  match t with
+  | Variable name ->
+      TypeVariableSet.singleton name
+  | Arrow (p, r) ->
+      TypeVariableSet.union (find_free_type_variables_in_type p) (find_free_type_variables_in_type r)
+  | Int ->
+      TypeVariableSet.empty
+  | Bool ->
+      TypeVariableSet.empty
+  | Tuple tuples ->
+      List.fold_left
+        (fun acc t -> TypeVariableSet.union acc (find_free_type_variables_in_type t))
+        TypeVariableSet.empty tuples
+
+
+let rec find_free_type_variables_in_scheme (sch: scheme) =
+  (* plan for scheme is to find all the ftvs in the scheme's mono type *)
+  (* and filter out all the ones that are bound in the forall*)
+  match sch with
+  | Forall (bound_vars, t) ->
+      let ftv_in_scheme = find_free_type_variables_in_type t in
+      List.fold_left (fun s v -> TypeVariableSet.remove v s) ftv_in_scheme bound_vars
+
+
+let find_free_type_vars_in_env (env : environment) : TypeVariableSet.t =
+  TermVariableMap.fold
+    (fun _name sch acc -> TypeVariableSet.union acc (find_free_type_variables_in_scheme sch))
+    env TypeVariableSet.empty
+
+
+(* let generalization (env : environment) (t : wtype) = *)
+
+(* ----------------------------------------- inference ----------------------------------------- *)
+(* TODO *)
+
 
 
 (* ------------------------------------------------------------------------------------------ *)
