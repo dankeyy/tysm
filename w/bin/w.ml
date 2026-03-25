@@ -236,7 +236,7 @@ let rec find_free_type_variables_in_type (t : wtype) =
         TypeVariableSet.empty tuples
 
 
-let rec find_free_type_variables_in_scheme (sch: scheme) =
+let find_free_type_variables_in_scheme (sch : scheme) =
   (* plan for scheme is to find all the ftvs in the scheme's mono type *)
   (* and filter out all the ones that are bound in the forall*)
   match sch with
@@ -251,12 +251,209 @@ let find_free_type_vars_in_env (env : environment) : TypeVariableSet.t =
     env TypeVariableSet.empty
 
 
-(* let generalization (env : environment) (t : wtype) = *)
+let generalization (env : environment) (t : wtype) : scheme =
+  (* generalization is basically just getting the types in T that could be made polymorphic *)
+  (* we do this by simply diffing with the env *)
+  (* then just return a new scheme with the unique vars *)
+  let type_vars = find_free_type_variables_in_type(t) in
+  let env_vars = find_free_type_vars_in_env(env) in
+  let diff = TypeVariableSet.diff type_vars env_vars in
+  let quantified_vars = TypeVariableSet.elements diff in
+
+  Forall (quantified_vars, t)
+
+
+let instantiate (sch : scheme) (infer_state : type_inference_state) : wtype =
+  (* instantiate fresh vars for type vars within the scheme *)
+  match sch with
+  | Forall (vars, t) ->
+    let subs =
+      List.fold_left(fun sub var ->
+          let fresh = fresh_type_variable (infer_state) in
+          TypeVariableMap.add var (Variable fresh) sub
+      ) TypeVariableMap.empty vars in
+
+    substitute t subs
+
+
 
 (* ----------------------------------------- inference ----------------------------------------- *)
-(* TODO *)
+exception UnboundVariable of string
+
+let rec infer (state : type_inference_state) (env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Variable    _ -> infer_variable    state env expr
+  | Abstraction _ -> infer_abstraction state env expr
+  | Application _ -> infer_application state env expr
+  | Let         _ -> infer_let         state env expr
+  | Lit (Int _)   -> infer_literal_int state env expr
+  | Lit (Bool _)  -> infer_literal_bool state env expr
+  | Tuple       _ -> infer_tuple       state env expr
 
 
+and infer_variable (state : type_inference_state) (env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Variable x ->
+      (match TermVariableMap.find_opt x env with
+       | None -> raise (UnboundVariable x)
+       | Some scheme ->
+           let t = instantiate scheme state in
+           let rule   = "infer-variable" in
+           let input  = show_expression expr in
+           let output = show_wtype t in
+           (TypeVariableMap.empty, t, make_tree rule input output []))
+  | _ -> failwith "impossible: infer_variable called on non variable"
+
+
+and infer_abstraction (state : type_inference_state) (env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Abstraction (param, body) ->
+      let alpha = fresh_type_variable state in
+
+      (* new env for param *)
+      let param_scheme = Forall ([], Variable alpha) in
+      let new_env = TermVariableMap.add param param_scheme env in
+
+      (* infer body and populate new scheme with it *)
+      let (s1, tau, body_tree) = infer state new_env body in
+
+      (* sub param in body *)
+      let alpha' = substitute (Variable alpha) s1 in
+      let arrow_ty = Arrow (alpha', tau) in
+
+      let rule   = "infer-abstraction" in
+      let input  = show_expression expr in
+      let output = show_wtype arrow_ty in
+      let tree   = make_tree rule input output [body_tree] in
+
+      (s1, arrow_ty, tree)
+
+  | _ -> failwith "impossible: infer_abstraction called on non abstraction"
+
+
+and infer_application (state : type_inference_state) (env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Application (func, arg) ->
+      let (s1, t1, func_tree) = infer state env func in
+      let env' = substitute_in_environment env s1 in
+      let (s2, t2, arg_tree) = infer state env' arg in
+      (* alpha will be the result *)
+      let alpha = fresh_type_variable state in
+
+      (* the body may have added constraints so we apply those aswell*)
+      let t1' = substitute t1 s2 in
+
+      (* body must equal t2 → α *)
+      let (s3, unify_tree) = unify t1' (Arrow (t2, Variable alpha)) in
+
+      let s = compose_substitutions s3 (compose_substitutions s2 s1) in
+
+      let result_type = substitute (Variable alpha) s3  in
+
+      let rule   = "infer-application" in
+      let input  = show_expression expr in
+      let output = show_wtype result_type in
+      let tree   = make_tree rule input output [func_tree; arg_tree; unify_tree] in
+
+      (s, result_type, tree)
+
+  | _ -> failwith "impossible: infer_application called on non application"
+
+
+and infer_let (state : type_inference_state) (env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Let (x, value, body) ->
+      let (s1, t1, value_tree) = infer state env value in
+
+      let env1 = substitute_in_environment env s1 in
+      let t1'  = substitute t1 s1 in
+
+      (* get a polymorphic scheme *)
+      let scheme = generalization env1 t1' in
+      let new_env = TermVariableMap.add x scheme env1 in
+
+      (* type it *)
+      let (s2, t2, body_tree) = infer state new_env body in
+
+      let s = compose_substitutions s2 s1 in
+      let rule = "infer-let" in
+      let input = show_expression expr in
+      let output = show_wtype t2 in
+      let tree = make_tree rule input output [value_tree; body_tree] in
+
+      (s, t2, tree)
+
+  | _ -> failwith "impossible: infer_let called on non let"
+
+
+and infer_literal_int (_state : type_inference_state) (_env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Lit (Int _) ->
+      let rule   = "infer-int" in
+      let input  = show_expression expr in
+      let output = show_wtype Int in
+      let tree   = make_tree rule input output [] in
+
+      (TypeVariableMap.empty, Int, tree)
+
+  | _ -> failwith "impossible: infer_int called on non int"
+
+
+and infer_literal_bool (_state : type_inference_state) (_env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Lit (Bool _) ->
+      let rule   = "infer-bool" in
+      let input  = show_expression expr in
+      let output = show_wtype Bool in
+      let tree   = make_tree rule input output [] in
+
+      (TypeVariableMap.empty, Bool, tree)
+
+  | _ -> failwith "impossible: infer_bool called on non bool"
+
+
+and infer_tuple (state : type_inference_state) (env : environment) (expr : expression)
+  : substitutions * wtype * inference_tree =
+  match expr with
+  | Tuple exprs ->
+      (* (current_subst, current_env, reversed_types, reversed_trees) *)
+      let initial = (TypeVariableMap.empty, env, [], []) in
+
+      let (final_subst, _, rev_types, rev_trees) =
+        List.fold_left
+          (fun (s_acc, env_acc, types_acc, trees_acc) e ->
+            let (s_i, ty_i, tree_i) = infer state env_acc e in
+
+            let env' = substitute_in_environment env_acc s_i in
+
+            let s_new = compose_substitutions s_i s_acc in
+
+            let ty_i' = substitute ty_i s_i in
+
+            (s_new, env', ty_i' :: types_acc, tree_i :: trees_acc)
+          )
+          initial
+          exprs
+      in
+
+      let tuple_type = Tuple (List.rev rev_types) in
+      let child_trees = List.rev rev_trees in
+
+      let rule   = "infer-tuple" in
+      let input  = show_expression expr in
+      let output = show_wtype tuple_type in
+      let tree   = make_tree rule input output child_trees in
+
+      (final_subst, tuple_type, tree)
+
+  | _ -> failwith "impossible: infer_tuple called on non tuple"
 
 (* ------------------------------------------------------------------------------------------ *)
 (* testing *)
@@ -326,6 +523,58 @@ let test_scheme_and_env () =
   print_endline "substitute_in_scheme + substitute_in_environment passin"
 
 
+let test_const () =
+  (* let const = λx.λy.x *)
+  (* in const 42 true*)
+  let test_const_ast : expression =
+    Let (
+        "const",
+        Abstraction ("x",
+        Abstraction ("y", Variable "x")
+        ),
+        Application (
+        Application (
+            Variable "const",
+            Lit (Int 42L)
+        ),
+        Lit (Bool true)
+        )
+    ) in
+
+  let state : type_inference_state = { counter = 0 } in
+  let env   : environment          = TermVariableMap.empty in
+
+  let (_final_subst, inferred_type, _inference_tree) =
+    infer state env test_const_ast
+  in
+
+  Printf.printf "Inferred type: %s\n" (show_wtype inferred_type);
+  (* Printf.printf "Final substitution: %s\n" (show_substitutions final_subst);  (\* optional *\) *)
+  (* Printf.printf "\nInference tree:\n%s\n" (show_inference_tree inference_tree); *)
+  print_endline "const inference passin"
+
+
+let test_id () =
+  let test_id_ast : expression =
+    Let (
+      "id",
+      Abstraction ("x", Variable "x"),               (* let λx.x *)
+      Tuple [                                        (* in (id 42, id true) *)
+        Application (Variable "id", Lit (Int 42L)) ;
+        Application (Variable "id", Lit (Bool true))
+      ]
+    ) in
+
+  let state : type_inference_state = { counter = 0 } in
+  let env : environment = TermVariableMap.empty in
+
+  let (_final_subst, inferred_type, _inference_tree) =
+    infer state env test_id_ast
+  in
+
+  Printf.printf "Inferred type: %s\n" (show_wtype inferred_type);
+  print_endline "id inference passed"
+
 let () =
   print_endline "\n";
 
@@ -339,4 +588,12 @@ let () =
 
   print_endline "baseline scheme and env test:";
   test_scheme_and_env ();
+  print_endline "-----------------------------------------";
+
+  print_endline "const test:";
+  test_const ();
+  print_endline "-----------------------------------------";
+
+  print_endline "const id:";
+  test_id ();
   print_endline "-----------------------------------------";
